@@ -1,34 +1,104 @@
 package org.apache.cordova;
 
-import java.io.BufferedInputStream;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.FileNotFoundException;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
-
-
 import android.net.Uri;
-import org.apache.cordova.CallbackContext;
-import org.apache.cordova.CordovaPlugin;
+import android.util.Log;
+
 import org.apache.cordova.CordovaResourceApi.OpenForReadResult;
-import org.apache.cordova.PluginResult;
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import android.util.Log;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
 
 public class Zip extends CordovaPlugin {
 
     private static final String LOG_TAG = "Zip";
+    private static final int BUFFER = 2048;
+
+    // Can't use DataInputStream because it has the wrong endian-ness.
+    private static int readInt(InputStream is) throws IOException {
+        int a = is.read();
+        int b = is.read();
+        int c = is.read();
+        int d = is.read();
+        return a | b << 8 | c << 16 | d << 24;
+    }
+
+    private static void zipSubFolder(CallbackContext callbackContext, ZipOutputStream outputStream, File sourceFolder, int basePathLength, List<String> directoriesToBeSkipped, List<String> filesToBeSkipped) throws IOException {
+        File[] fileList = sourceFolder.listFiles();
+        BufferedInputStream origin;
+
+        if (fileList != null) {
+            for (File file : fileList) {
+                if (directoriesToBeSkipped != null && directoriesToBeSkipped.size() > 0
+                        && filesToBeSkipped.contains(file.getName())) {
+                    continue;
+                }
+                if (filesToBeSkipped != null && filesToBeSkipped.size() > 0
+                        && file.getPath() != null && !file.getPath().isEmpty()) {
+                    boolean skip = false;
+                    for (String fileName : filesToBeSkipped) {
+                        if (file.getPath().contains(fileName)) {
+                            skip = true;
+                            break;
+                        }
+                    }
+                    if (skip) {
+                        continue;
+                    }
+                }
+
+                if (file.isDirectory()) {
+                    zipSubFolder(callbackContext, outputStream, file, basePathLength, directoriesToBeSkipped, filesToBeSkipped);
+                } else {
+                    byte data[] = new byte[BUFFER];
+
+                    String unmodifiedFilePath = file.getPath();
+                    String relativePath = unmodifiedFilePath.substring(basePathLength);
+                    relativePath = relativePath.substring(relativePath.indexOf("/", 1), relativePath.length());
+
+                    FileInputStream fileInputStream = new FileInputStream(unmodifiedFilePath);
+                    origin = new BufferedInputStream(fileInputStream, BUFFER);
+
+                    ZipEntry zipEntry = new ZipEntry(relativePath);
+                    outputStream.putNextEntry(zipEntry);
+
+                    int count;
+                    while ((count = origin.read(data, 0, BUFFER)) != -1) {
+                        outputStream.write(data, 0, count);
+                    }
+
+                    origin.close();
+                    callbackContext.success();
+                }
+            }
+        }
+    }
+
+    private static String getLastPathComponent(String sourceFolderPath) {
+        String[] segments = sourceFolderPath.split("/");
+        String lastPathComponent = segments[segments.length - 1];
+        return lastPathComponent;
+    }
 
     @Override
     public boolean execute(String action, CordovaArgs args, final CallbackContext callbackContext) throws JSONException {
         if ("unzip".equals(action)) {
             unzip(args, callbackContext);
             return true;
+        } else if ("zip".equals(action)) {
+            zip(args, callbackContext);
         }
         return false;
     }
@@ -41,14 +111,73 @@ public class Zip extends CordovaPlugin {
         });
     }
 
-    // Can't use DataInputStream because it has the wrong endian-ness.
-    private static int readInt(InputStream is) throws IOException {
-        int a = is.read();
-        int b = is.read();
-        int c = is.read();
-        int d = is.read();
-        return a | b << 8 | c << 16 | d << 24;
+    private void zip(final CordovaArgs args, final CallbackContext callbackContext) {
+        this.cordova.getThreadPool().execute(new Runnable() {
+            public void run() {
+                zipSync(args, callbackContext);
+            }
+        });
     }
+
+    private void zipSync(CordovaArgs args, CallbackContext callbackContext) {
+        try {
+
+            String sourceFolderPath = args.getString(1);
+            String zipFilePath = args.getString(2);
+            List<String> directoriesToBeSkipped = getArrayFromArguments(args.getString(3));
+            List<String> filesToBeSkipped = getArrayFromArguments(args.getString(4));
+
+            BufferedInputStream origin;
+            File zipFile = new File(zipFilePath);
+            File sourceFolder = new File(sourceFolderPath);
+            zipFile.getParentFile().mkdirs();
+            zipFile.createNewFile();
+            FileOutputStream dest = new FileOutputStream(zipFile);
+            ZipOutputStream out = new ZipOutputStream(new BufferedOutputStream(dest));
+
+            if (sourceFolder.isDirectory()) {
+                zipSubFolder(callbackContext, out, sourceFolder, sourceFolder.getParent().length(), directoriesToBeSkipped, filesToBeSkipped);
+            } else {
+                byte data[] = new byte[BUFFER];
+
+                FileInputStream fi = new FileInputStream(sourceFolder);
+                origin = new BufferedInputStream(fi, BUFFER);
+
+                ZipEntry entry = new ZipEntry(getLastPathComponent(sourceFolder.getPath()));
+                out.putNextEntry(entry);
+
+                int count;
+                while ((count = origin.read(data, 0, BUFFER)) != -1) {
+                    out.write(data, 0, count);
+                }
+                callbackContext.success();
+            }
+
+        } catch (Exception e) {
+            String errorMessage = "An error occurred while zipping.";
+            callbackContext.error(errorMessage);
+            Log.e(LOG_TAG, errorMessage, e);
+        }
+
+    }
+
+    private List<String> getArrayFromArguments(String argument) {
+        List<String> list = new ArrayList<>();
+        try {
+            JSONArray jsonArray = new JSONArray(argument);
+
+            if (jsonArray.length() > 0) {
+                for (int index = 0; index < jsonArray.length(); index++) {
+                    list.add(jsonArray.getString(index));
+                }
+            }
+
+        } catch (JSONException e) {
+            e.printStackTrace();
+        }
+        return list;
+    }
+
 
     private void unzipSync(CordovaArgs args, CallbackContext callbackContext) {
         InputStream inputStream = null;
@@ -74,7 +203,7 @@ public class Zip extends CordovaPlugin {
             File outputDir = resourceApi.mapUriToFile(outputUri);
             outputDirectory = outputDir.getAbsolutePath();
             outputDirectory += outputDirectory.endsWith(File.separator) ? "" : File.separator;
-            if (outputDir == null || (!outputDir.exists() && !outputDir.mkdirs())){
+            if (outputDir == null || (!outputDir.exists() && !outputDir.mkdirs())) {
                 String errorMessage = "Could not create output directory";
                 callbackContext.error(errorMessage);
                 Log.e(LOG_TAG, errorMessage);
@@ -116,23 +245,21 @@ public class Zip extends CordovaPlugin {
             byte[] buffer = new byte[32 * 1024];
             boolean anyEntries = false;
 
-            while ((ze = zis.getNextEntry()) != null)
-            {
+            while ((ze = zis.getNextEntry()) != null) {
                 anyEntries = true;
                 String compressedName = ze.getName();
 
                 if (ze.isDirectory()) {
-                   File dir = new File(outputDirectory + compressedName);
-                   dir.mkdirs();
+                    File dir = new File(outputDirectory + compressedName);
+                    dir.mkdirs();
                 } else {
                     File file = new File(outputDirectory + compressedName);
                     file.getParentFile().mkdirs();
-                    if(file.exists() || file.createNewFile()){
+                    if (file.exists() || file.createNewFile()) {
                         Log.w("Zip", "extracting: " + file.getPath());
                         FileOutputStream fout = new FileOutputStream(file);
                         int count;
-                        while ((count = zis.read(buffer)) != -1)
-                        {
+                        while ((count = zis.read(buffer)) != -1) {
                             fout.write(buffer, 0, count);
                         }
                         fout.close();
@@ -182,25 +309,31 @@ public class Zip extends CordovaPlugin {
     private static class ProgressEvent {
         private long loaded;
         private long total;
+
         public long getLoaded() {
             return loaded;
         }
+
         public void setLoaded(long loaded) {
             this.loaded = loaded;
         }
+
         public void addLoaded(long add) {
             this.loaded += add;
         }
+
         public long getTotal() {
             return total;
         }
+
         public void setTotal(long total) {
             this.total = total;
         }
+
         public JSONObject toJSONObject() throws JSONException {
             return new JSONObject(
                     "{loaded:" + loaded +
-                    ",total:" + total + "}");
+                            ",total:" + total + "}");
         }
     }
 }

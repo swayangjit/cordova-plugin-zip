@@ -8,6 +8,10 @@ function newProgressEvent(result) {
     return event;
 }
 
+exports.zip = function(sourceFolderPath, zipFilePath, directoriesToBeSkipped, filesToBeSkipped, callback) {
+    exec(callback, 'Zip', 'zip', [sourceFolderPath, zipFilePath, directoriesToBeSkipped, filesToBeSkipped]);
+};
+
 exports.unzip = function(fileName, outputDirectory, callback, progressCallback) {
     var win = function(result) {
         if (result && typeof result.loaded != "undefined") {
